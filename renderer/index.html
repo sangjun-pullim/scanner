@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file:">
+  <title>여권 스캐너</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #eee;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    
+    header {
+      text-align: center;
+      padding: 20px 0 30px;
+    }
+    
+    header h1 {
+      font-size: 28px;
+      font-weight: 300;
+      letter-spacing: 2px;
+    }
+    
+    .status-bar {
+      display: flex;
+      justify-content: center;
+      gap: 30px;
+      padding: 15px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 10px;
+      margin-bottom: 30px;
+    }
+    
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #ff4757;
+      transition: background 0.3s;
+    }
+    
+    .status-dot.connected {
+      background: #2ed573;
+      box-shadow: 0 0 10px #2ed573;
+    }
+    
+    .actions {
+      display: flex;
+      justify-content: center;
+      gap: 15px;
+      margin-bottom: 30px;
+    }
+    
+    button {
+      padding: 12px 30px;
+      font-size: 14px;
+      border: none;
+      border-radius: 25px;
+      cursor: pointer;
+      transition: all 0.3s;
+      font-weight: 500;
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+    }
+    
+    .btn-secondary {
+      background: rgba(255,255,255,0.1);
+      color: #eee;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    
+    .btn-secondary:hover {
+      background: rgba(255,255,255,0.2);
+    }
+    
+    .scan-result {
+      background: rgba(255,255,255,0.05);
+      border-radius: 15px;
+      padding: 25px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    
+    .scan-result.show {
+      display: block;
+      animation: fadeIn 0.5s ease;
+    }
+    
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    
+    .scan-result h3 {
+      font-size: 18px;
+      font-weight: 400;
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    .result-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 15px;
+    }
+    
+    .result-item {
+      background: rgba(255,255,255,0.05);
+      padding: 15px;
+      border-radius: 10px;
+    }
+    
+    .result-item label {
+      display: block;
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 5px;
+    }
+    
+    .result-item .value {
+      font-size: 16px;
+      font-weight: 500;
+    }
+    
+    .result-item.full-width {
+      grid-column: 1 / -1;
+    }
+    
+    .mrz-display {
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 12px;
+      background: rgba(0,0,0,0.3);
+      padding: 15px;
+      border-radius: 8px;
+      word-break: break-all;
+      line-height: 1.6;
+    }
+    
+    .history {
+      margin-top: 30px;
+    }
+    
+    .history h3 {
+      font-size: 16px;
+      font-weight: 400;
+      margin-bottom: 15px;
+      color: #888;
+    }
+    
+    .history-list {
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    
+    .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 15px;
+      background: rgba(255,255,255,0.03);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+    
+    .history-item .passport-no {
+      font-weight: 500;
+    }
+    
+    .history-item .time {
+      color: #888;
+      font-size: 12px;
+    }
+    
+    .waiting-indicator {
+      text-align: center;
+      padding: 60px 20px;
+      color: #666;
+    }
+    
+    .waiting-indicator .pulse {
+      width: 60px;
+      height: 60px;
+      border: 3px solid rgba(102, 126, 234, 0.3);
+      border-radius: 50%;
+      margin: 0 auto 20px;
+      animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.1); opacity: 0.5; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🛂 PASSPORT SCANNER</h1>
+    </header>
+    
+    <div class="status-bar">
+      <div class="status-item">
+        <div class="status-dot" id="scannerStatus"></div>
+        <span id="scannerStatusText">스캐너 연결 안됨</span>
+      </div>
+    </div>
+    
+    <div class="actions">
+      <button class="btn-primary" id="btnManualScan">수동 스캔</button>
+      <button class="btn-secondary" id="btnReconnect">재연결</button>
+    </div>
+    
+    <div class="scan-result" id="scanResult">
+      <h3>최근 스캔 결과</h3>
+      <div class="result-grid">
+        <div class="result-item">
+          <label>여권번호</label>
+          <div class="value" id="resultPassportNo">-</div>
+        </div>
+        <div class="result-item">
+          <label>이름</label>
+          <div class="value" id="resultName">-</div>
+        </div>
+        <div class="result-item">
+          <label>국적</label>
+          <div class="value" id="resultNationality">-</div>
+        </div>
+        <div class="result-item">
+          <label>생년월일</label>
+          <div class="value" id="resultBirthDate">-</div>
+        </div>
+        <div class="result-item">
+          <label>성별</label>
+          <div class="value" id="resultSex">-</div>
+        </div>
+        <div class="result-item">
+          <label>만료일</label>
+          <div class="value" id="resultExpiry">-</div>
+        </div>
+        <div class="result-item full-width">
+          <label>MRZ 원문</label>
+          <div class="mrz-display" id="resultMrz">-</div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="waiting-indicator" id="waitingIndicator">
+      <div class="pulse"></div>
+      <p>여권을 스캐너에 올려주세요</p>
+    </div>
+    
+    <div class="history">
+      <h3>스캔 기록</h3>
+      <div class="history-list" id="historyList">
+        <!-- 기록이 여기에 추가됨 -->
+      </div>
+    </div>
+  </div>
+  
+  <script src="renderer.js"></script>
+</body>
+</html>

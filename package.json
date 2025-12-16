@@ -1,0 +1,78 @@
+{
+  "name": "passport-scanner-electron",
+  "version": "1.0.0",
+  "description": "여권/신분증 자동 스캔 Electron 앱 (QuantA6 스캐너)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "iconv-lite": "^0.7.1",
+    "koffi": "^2.8.0",
+    "usb-detection": "^4.14.0"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.0"
+  },
+  "build": {
+    "appId": "com.passport.scanner",
+    "win": {
+      "target": "nsis",
+      "icon": "icon.ico"
+    },
+    "extraFiles": [
+      {
+        "from": "QuantA64.dll",
+        "to": "."
+      },
+      {
+        "from": "QuantA6.dll",
+        "to": "."
+      },
+      {
+        "from": "QuantUsb64.dll",
+        "to": "."
+      },
+      {
+        "from": "QuantUsb.dll",
+        "to": "."
+      },
+      {
+        "from": "HsIdOCR64.dll",
+        "to": "."
+      },
+      {
+        "from": "HsIdOCR.dll",
+        "to": "."
+      },
+      {
+        "from": "HsOCR64.dll",
+        "to": "."
+      },
+      {
+        "from": "HsOCR.dll",
+        "to": "."
+      },
+      {
+        "from": "HsidRec64.dll",
+        "to": "."
+      },
+      {
+        "from": "HsidRec.dll",
+        "to": "."
+      },
+      {
+        "from": "Crypt64.dll",
+        "to": "."
+      },
+      {
+        "from": "Crypt.dll",
+        "to": "."
+      }
+    ]
+  }
+}
