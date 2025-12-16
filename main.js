@@ -272,7 +272,10 @@ async function performScan() {
       String(now.getHours()).padStart(2, '0') +
       String(now.getMinutes()).padStart(2, '0') +
       String(now.getSeconds()).padStart(2, '0');
-    const tempBase = path.join(SAVE_FOLDER, timestamp);
+    // 스캔 임시 파일명이 초 단위면(500ms 루프) 이전 스캔과 충돌/재사용될 수 있어 ms를 포함해 유니크하게 만든다.
+    const ms0 = String(now.getMilliseconds()).padStart(3, '0');
+    const scanStamp = `${timestamp}_${ms0}`;
+    const tempBase = path.join(SAVE_FOLDER, scanStamp);
     
     // 스캔 시도 (여권 + 카드 자동 감지)
     const scanResult = await scanner.scanAuto(tempBase);
@@ -283,8 +286,8 @@ async function performScan() {
         console.log('[App] Card scan mode (nType): 0x' + scanResult.cardType.toString(16));
       }
       // 스캔 결과 파일이 실제로 생성될 때까지 먼저 대기 (OCR/MRZ는 저장 완료 후에 안정적)
-      let expectedBmp = timestamp + '.bmp';
-      let expectedIR = timestamp + '_IR.bmp';
+      let expectedBmp = scanStamp + '.bmp';
+      let expectedIR = scanStamp + '_IR.bmp';
       let expectedBmpPath = path.join(SAVE_FOLDER, expectedBmp);
       let expectedIRPath = path.join(SAVE_FOLDER, expectedIR);
 
@@ -307,23 +310,26 @@ async function performScan() {
       let documentData = null;
       let mrzText = '';
 
-      // 1) MRZ는 스캔 타입과 무관하게 읽어보고, "유효한 여권 MRZ"면 여권으로 확정
-      //    (일부 장치/SDK에서는 여권이 ScanCard 경로로 스캔되는 경우가 있음)
+      // 1) MRZ는 여권 스캔에서만 시도
+      // - 카드 스캔에서 MRZ를 매번 시도하면 Leptonica(TIFF) 에러가 반복되고,
+      //   일부 환경에서 이후 OCR 버퍼가 계속 0으로 남는(계속 실패처럼 보이는) 현상이 생길 수 있다.
       let isPassportConfirmed = false;
-      for (let i = 0; i < 10; i++) {
-        const candidate = (await scanner.readMRZ()) || '';
-        if (candidate) console.log('[App] Raw MRZ:', candidate);
-        if (isValidPassportMRZ(candidate)) {
-          mrzText = candidate;
-          console.log('[App] Valid passport MRZ detected');
-          const passportNo = extractPassportNo(mrzText);
-          if (passportNo) documentId = passportNo;
-          documentData = parseMrzFull(mrzText);
-          if (documentData) documentData.documentType = 'PASSPORT';
-          isPassportConfirmed = true;
-          break;
+      if (scanResult.type === 'passport') {
+        for (let i = 0; i < 10; i++) {
+          const candidate = (await scanner.readMRZ()) || '';
+          if (candidate) console.log('[App] Raw MRZ:', candidate);
+          if (isValidPassportMRZ(candidate)) {
+            mrzText = candidate;
+            console.log('[App] Valid passport MRZ detected');
+            const passportNo = extractPassportNo(mrzText);
+            if (passportNo) documentId = passportNo;
+            documentData = parseMrzFull(mrzText);
+            if (documentData) documentData.documentType = 'PASSPORT';
+            isPassportConfirmed = true;
+            break;
+          }
+          await sleep(300);
         }
-        await sleep(300);
       }
       
       // 2) 카드 스캔 모드인 경우에만 OCR을 "재시도"하며 읽기
@@ -361,78 +367,8 @@ async function performScan() {
           await sleep(250);
         }
 
-        // 2-2) 여전히 OCR이 비고, cardType=0x0 이었다면 다른 nType으로 1회 재시도
-        //      (주민등록증 OCR 모드가 따로 있는 SDK/펌웨어 대응)
-        if ((!documentData || !documentData.documentType) && scanResult.cardType === 0x0 && scanner && typeof scanner.scanCardWithType === 'function') {
-          console.log('[App] Card OCR empty - retry ScanCard with other nType...');
-          const originalBmp = expectedBmpPath;
-          const originalIr = expectedIRPath;
-
-          for (const retryType of [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]) {
-            const retryStamp = `${timestamp}R${retryType}`;
-            const retryBase = path.join(SAVE_FOLDER, retryStamp);
-            const retryBmp = path.join(SAVE_FOLDER, `${retryStamp}.bmp`);
-            const retryIr = path.join(SAVE_FOLDER, `${retryStamp}_IR.bmp`);
-
-            try {
-              const r = await scanner.scanCardWithType(retryBase, retryType);
-              if (r !== 0x00) continue;
-            } catch (e) {
-              console.warn('[App] ScanCardWithType failed:', e.message);
-              break;
-            }
-
-            await waitForFileExists(retryBmp, 8000, 250);
-            await waitForFileExists(retryIr, 1500, 250);
-            await sleep(600);
-
-            for (let i = 0; i < 6; i++) {
-              const license = await scanner.readDriverLicense();
-              const idCard = await scanner.readIDCard();
-              const alien = await scanner.readAlienCard();
-
-              if (looksLikeKoreanRRN(idCard?.idNo)) {
-                documentId = String(idCard.idNo).replace(/-/g, '').substring(0, 6);
-                documentData = { ...idCard, documentType: 'ID_CARD' };
-                expectedBmpPath = retryBmp;
-                expectedIRPath = retryIr;
-                expectedBmp = `${retryStamp}.bmp`;
-                expectedIR = `${retryStamp}_IR.bmp`;
-                console.log('[App] Retry nType=0x' + retryType.toString(16) + ' matched ID_CARD');
-                break;
-              }
-              if (looksLikeDriverLicenseNo(license?.licenseNo)) {
-                documentId = license.licenseNo.replace(/-/g, '');
-                documentData = { ...license, documentType: 'DRIVER_LICENSE' };
-                expectedBmpPath = retryBmp;
-                expectedIRPath = retryIr;
-                expectedBmp = `${retryStamp}.bmp`;
-                expectedIR = `${retryStamp}_IR.bmp`;
-                console.log('[App] Retry nType=0x' + retryType.toString(16) + ' matched DRIVER_LICENSE');
-                break;
-              }
-              if (looksLikeAlienRegNo(alien?.alienNo)) {
-                documentId = alien.alienNo.replace(/-/g, '').substring(0, 6);
-                documentData = { ...alien, documentType: 'ALIEN_CARD' };
-                expectedBmpPath = retryBmp;
-                expectedIRPath = retryIr;
-                expectedBmp = `${retryStamp}.bmp`;
-                expectedIR = `${retryStamp}_IR.bmp`;
-                console.log('[App] Retry nType=0x' + retryType.toString(16) + ' matched ALIEN_CARD');
-                break;
-              }
-
-              await sleep(250);
-            }
-
-            if (documentData?.documentType) {
-              // 기존(0x0)로 생성된 이미지 파일은 혼동 방지를 위해 삭제 시도
-              try { if (fs.existsSync(originalBmp)) fs.unlinkSync(originalBmp); } catch (_) {}
-              try { if (fs.existsSync(originalIr)) fs.unlinkSync(originalIr); } catch (_) {}
-              break;
-            }
-          }
-        }
+        // NOTE: "OCR empty → nType 바꿔 재스캔"은 현장 로그 기준 효과가 없고(성공 사례 없음),
+        // 오히려 시간/불안정만 증가하여 제거함.
       }
 
       // 인식 여부 최종 판단: MRZ(여권) 또는 OCR(카드) 중 하나라도 있어야 "성공"
