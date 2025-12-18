@@ -24,6 +24,48 @@ let usbMonitor = null;
 let scanLoopTimer = null;
 let isScanning = false;
 let lastFailedAt = 0;
+let pendingManualScan = false;
+let lastReconnectAt = 0;
+let consecutiveScanAutoTimeouts = 0;
+
+async function forceReconnectScanner(reason = 'unknown') {
+  // reconnect storm 방지 (예: scanAuto가 계속 timeout이면 0.5초마다 재연결이 연쇄 발생)
+  const now = Date.now();
+  if (now - lastReconnectAt < 3000) {
+    console.warn('[App] Reconnect suppressed (too frequent):', reason);
+    return false;
+  }
+  lastReconnectAt = now;
+
+  console.warn('[App] Force reconnect scanner:', reason);
+  // reconnect 동안 scan loop가 다시 스캔을 시도하면 상태가 꼬일 수 있으니 잠시 중지
+  const wasRunning = !!scanLoopTimer;
+  stopScanLoop();
+  // 1) 기존 연결 닫기(완료될 때까지 대기)
+  await closeDevice().catch(() => {});
+  // 장치/드라이버 정리 시간 약간 부여
+  await sleep(250);
+
+  // 2) 워커 자체를 재시작(걸린 호출을 끊기 위해)
+  try {
+    if (scanner && typeof scanner.destroy === 'function') {
+      await withTimeout(scanner.destroy(), 1500, 'scanner.destroy');
+    }
+  } catch (_) {}
+
+  // 3) 새 워커/클라이언트 생성 후 재시도
+  scanner = new ScannerClient();
+  const inited = await withTimeout(scanner.init(), 3000, 'scanner.init').catch(() => false);
+  if (!inited) {
+    scannerOpened = false;
+    sendToRenderer('scanner-status', { connected: false, error: 'DLL 로드 실패' });
+    return false;
+  }
+
+  const success = await tryOpenDevice().catch(() => false);
+  if (success && wasRunning) startScanLoop();
+  return !!success;
+}
 
 function withTimeout(promise, ms, label = 'operation') {
   let timeoutId = null;
@@ -228,13 +270,6 @@ function isValidPassportMRZ(mrz) {
   return (cleaned.startsWith('P') || cleaned.startsWith('P<')) && cleaned.length >= 60;
 }
 
-function isValidOCRString(str) {
-  if (!str || typeof str !== 'string') return false;
-  // null/제어문자 포함이면 무효
-  if (/[\x00-\x1F]/.test(str)) return false;
-  return str.trim().length >= 2;
-}
-
 function looksLikeKoreanRRN(idNo) {
   if (!idNo) return false;
   const s = String(idNo).trim();
@@ -259,236 +294,409 @@ function looksLikeAlienRegNo(alienNo) {
   return false;
 }
 
+function isLikelyValidOcr(documentData) {
+  if (!documentData || !documentData.documentType) return false;
+
+  if (documentData.documentType === 'ID_CARD') {
+    // 주민번호가 가장 신뢰도 높음. 일부 케이스에서는 name만 먼저 나오는 경우가 있어 최소 기준 완화
+    return looksLikeKoreanRRN(documentData.idNo) || (String(documentData.name || '').trim().length >= 2);
+  }
+  if (documentData.documentType === 'DRIVER_LICENSE') {
+    return looksLikeDriverLicenseNo(documentData.licenseNo) || (String(documentData.name || '').trim().length >= 2);
+  }
+  if (documentData.documentType === 'ALIEN_CARD') {
+    return looksLikeAlienRegNo(documentData.alienNo) || (String(documentData.name || '').trim().length >= 2);
+  }
+  if (documentData.documentType === 'PASSPORT') {
+    return true;
+  }
+  return false;
+}
+
+function sanitizeFileComponent(s) {
+  return String(s || '')
+    .replace(/[\x00-\x1F\x7F<>:"/\\|?*]/g, '')
+    .trim();
+}
+
+function normalizeYyyyMmDd(input) {
+  // 목표 포맷: YYYYMMDD
+  // 입력 예:
+  // - 2011.8.10.
+  // - 2017.01.16.
+  // - 2027.12.31.
+  // - 2027-12-31
+  // - 2027-12-31_... (일부 섞임)
+  // - "~2027.12.8" / ":~2027.12.8" 등
+  if (input == null) return '';
+  const s = String(input).trim();
+  if (!s) return '';
+
+  // YYYYMMDD가 이미 들어있는 경우 (최초 8자리)
+  const compact = s.replace(/[^\d]/g, '');
+  if (/^\d{8}/.test(compact)) return compact.slice(0, 8);
+
+  // 구분자 기반 YYYY[.-/]M[.-/]D
+  const m = s.match(/(19\d{2}|20\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})/);
+  if (!m) return '';
+  const yyyy = m[1];
+  const mm = String(parseInt(m[2], 10)).padStart(2, '0');
+  const dd = String(parseInt(m[3], 10)).padStart(2, '0');
+  return `${yyyy}${mm}${dd}`;
+}
+
+function normalizeDateLikeRange(input) {
+  // 운전면허 적성기간(validPeriod) 같은 값이 "~2027.12.8" / "2020.1.1~2027.12.8" 형태일 수 있어
+  // 단일/범위 모두 YYYYMMDD(또는 YYYYMMDD~YYYYMMDD)로 정규화
+  if (input == null) return '';
+  const s = String(input).trim();
+  if (!s) return '';
+
+  if (s.includes('~')) {
+    const parts = s.split('~').map(p => p.trim());
+    const left = normalizeYyyyMmDd(parts[0]);
+    const right = normalizeYyyyMmDd(parts[1]);
+    if (left && right) return `${left}~${right}`;
+    if (!left && right) return `~${right}`;
+    if (left && !right) return `${left}~`;
+    return '';
+  }
+  return normalizeYyyyMmDd(s);
+}
+
+function normalizeDocumentDataDates(documentData) {
+  if (!documentData || typeof documentData !== 'object') return documentData;
+  const docType = documentData.documentType;
+  const out = { ...documentData };
+
+  // 공통적으로 "date" 성격인 필드들을 문서별로 정규화
+  if (docType === 'ID_CARD') {
+    if ('issuedDate' in out) out.issuedDate = normalizeDateLikeRange(out.issuedDate);
+  } else if (docType === 'DRIVER_LICENSE') {
+    if ('issuedDate' in out) out.issuedDate = normalizeDateLikeRange(out.issuedDate);
+    if ('validPeriod' in out) out.validPeriod = normalizeDateLikeRange(out.validPeriod);
+  } else if (docType === 'ALIEN_CARD') {
+    // 현재는 별도 날짜 필드 없음(필요 시 추가)
+  } else if (docType === 'PASSPORT') {
+    // MRZ 파서가 YYYY-MM-DD를 반환하므로 YYYYMMDD로 변환
+    if ('birthDate' in out) out.birthDate = normalizeDateLikeRange(out.birthDate);
+    if ('expiryDate' in out) out.expiryDate = normalizeDateLikeRange(out.expiryDate);
+  }
+
+  return out;
+}
+
+function createScanStamp(date = new Date()) {
+  // .NET과 동일한 형식: yyyyMMdd_HHmmss + _ms (1초 내 연속 스캔 시 파일명 충돌 방지)
+  const timestamp = date.getFullYear().toString() +
+    String(date.getMonth() + 1).padStart(2, '0') +
+    String(date.getDate()).padStart(2, '0') + '_' +
+    String(date.getHours()).padStart(2, '0') +
+    String(date.getMinutes()).padStart(2, '0') +
+    String(date.getSeconds()).padStart(2, '0');
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  return `${timestamp}_${ms}`;
+}
+
+async function scanStep(tempBase) {
+  // 센서 기반 자동 감지: 카드/여권 1회 스캔
+  return await withTimeout(scanner.scanAuto(tempBase), 12000, 'scanner.scanAuto');
+}
+
+async function docTypeStep() {
+  // C# 샘플의 QuantA6_GetType() 대응
+  return await withTimeout(scanner.getDocumentType(), 1500, 'scanner.getDocumentType').catch(() => null);
+}
+
+async function docTypeStepWithRetry(maxTries = 3, delayMs = 300) {
+  // GetType()는 스캔 직후/직전 실패(A스캔) 이후 잠깐 UNKNOWN을 줄 수 있어 짧게 폴링
+  let last = null;
+  for (let i = 0; i < maxTries; i++) {
+    last = await docTypeStep();
+    if (last && last.name && last.name !== 'UNKNOWN') return last;
+    await sleep(delayMs);
+  }
+  return last;
+}
+
+async function waitImagesStep(scanStamp) {
+  // scanAuto(outputBase) => outputBase.bmp, outputBase_IR.bmp 생성
+  const bmpPath = path.join(SAVE_FOLDER, `${scanStamp}.bmp`);
+  const irPath = path.join(SAVE_FOLDER, `${scanStamp}_IR.bmp`);
+
+  const bmpReady = await waitForFileExists(bmpPath, 8000, 250);
+  if (!bmpReady) {
+    return { bmpPath: null, irPath: null };
+  }
+  // IR은 옵션
+  await waitForFileExists(irPath, 1500, 250);
+  // OCR/MRZ 값이 안정적으로 채워질 시간을 약간 부여
+  await sleep(500);
+
+  return {
+    bmpPath: fs.existsSync(bmpPath) ? bmpPath : null,
+    irPath: fs.existsSync(irPath) ? irPath : null
+  };
+}
+
+async function mrzStep() {
+  // C# 샘플의 QuantA6_ReadMRZ() 대응
+  // 일부 환경에서 바로 값이 안 채워질 수 있어 짧게만 재시도
+  for (let i = 0; i < 3; i++) {
+    const mrz = (await withTimeout(scanner.readMRZ(), 1500, 'scanner.readMRZ').catch(() => '')) || '';
+    if (isValidPassportMRZ(mrz)) return mrz;
+    await sleep(250);
+  }
+  return '';
+}
+
+async function ocrStep(docType) {
+  // C# 샘플의 type 분기 + OCR 함수 호출 대응
+  const name = docType?.name || 'UNKNOWN';
+
+  if (name === 'ID_CARD') {
+    for (let i = 0; i < 4; i++) {
+      const v = await withTimeout(scanner.readIDCard(), 1500, 'scanner.readIDCard').catch(() => null);
+      const r = v ? { ...v, documentType: 'ID_CARD' } : null;
+      if (isLikelyValidOcr(r)) return r;
+      await sleep(500);
+    }
+    return null;
+  }
+  if (name === 'DRIVER_LICENSE') {
+    // NOTE: 운전면허는 인식실패한 스캔 이후 첫 스캔에서 OCR 버퍼가 늦게 채워지는 케이스가 있어
+    // "재스캔"을 요구하기보다 같은 스캔에 대해 OCR을 더 오래 폴링한다.
+    for (let i = 0; i < 8; i++) {
+      const v = await withTimeout(scanner.readDriverLicense(), 1500, 'scanner.readDriverLicense').catch(() => null);
+      const r = v ? { ...v, documentType: 'DRIVER_LICENSE' } : null;
+      if (isLikelyValidOcr(r)) return r;
+      await sleep(800);
+    }
+    return null;
+  }
+  if (name === 'ALIEN_CARD') {
+    for (let i = 0; i < 4; i++) {
+      const v = await withTimeout(scanner.readAlienCard(), 1500, 'scanner.readAlienCard').catch(() => null);
+      const r = v ? { ...v, documentType: 'ALIEN_CARD' } : null;
+      if (isLikelyValidOcr(r)) return r;
+      await sleep(500);
+    }
+    return null;
+  }
+
+  // UNKNOWN이면 1회씩만 호출해서 가장 그럴듯한 결과를 선택 (과한 루프/재시도 제거)
+  // IMPORTANT: DLL 호출은 re-entrant가 아닐 수 있어 병렬 호출 금지 (worker thread 출력 interleave + 상태 꼬임 방지)
+  for (let round = 0; round < 2; round++) {
+    const idCard = await withTimeout(scanner.readIDCard(), 1500, 'scanner.readIDCard').catch(() => null);
+    const idR = idCard ? { ...idCard, documentType: 'ID_CARD' } : null;
+    if (isLikelyValidOcr(idR)) return idR;
+
+    const license = await withTimeout(scanner.readDriverLicense(), 1500, 'scanner.readDriverLicense').catch(() => null);
+    const licR = license ? { ...license, documentType: 'DRIVER_LICENSE' } : null;
+    if (isLikelyValidOcr(licR)) return licR;
+
+    const alien = await withTimeout(scanner.readAlienCard(), 1500, 'scanner.readAlienCard').catch(() => null);
+    const alienR = alien ? { ...alien, documentType: 'ALIEN_CARD' } : null;
+    if (isLikelyValidOcr(alienR)) return alienR;
+
+    await sleep(300);
+  }
+
+  return null;
+}
+
+function deriveDocumentId(documentData, mrzText) {
+  if (mrzText) {
+    const passportNo = extractPassportNo(mrzText);
+    if (passportNo) return passportNo;
+    return 'PASSPORT';
+  }
+
+  if (!documentData) return 'UNKNOWN';
+
+  if (documentData.documentType === 'ID_CARD' && looksLikeKoreanRRN(documentData.idNo)) {
+    return String(documentData.idNo).replace(/-/g, '').substring(0, 6);
+  }
+  if (documentData.documentType === 'DRIVER_LICENSE' && looksLikeDriverLicenseNo(documentData.licenseNo)) {
+    return String(documentData.licenseNo).replace(/-/g, '');
+  }
+  if (documentData.documentType === 'ALIEN_CARD' && looksLikeAlienRegNo(documentData.alienNo)) {
+    return String(documentData.alienNo).replace(/-/g, '').substring(0, 6);
+  }
+  return documentData.documentType || 'UNKNOWN';
+}
+
+function buildTextContent({ mrzText, documentData }) {
+  if (mrzText && mrzText.length > 10) return mrzText;
+  if (!documentData || !documentData.documentType) return '[인식 실패]\n문서를 인식하지 못했습니다.';
+
+  const lines = [];
+  lines.push(`[${documentData.documentType}]`);
+  if (documentData.name) lines.push(`이름: ${documentData.name}`);
+  if (documentData.idNo) lines.push(`주민번호: ${documentData.idNo}`);
+  if (documentData.licenseNo) lines.push(`면허번호: ${documentData.licenseNo}`);
+  if (documentData.licenseType) lines.push(`면허종류: ${documentData.licenseType}`);
+  if (documentData.validPeriod) lines.push(`적성기간: ${documentData.validPeriod}`);
+  if (documentData.alienNo) lines.push(`외국인번호: ${documentData.alienNo}`);
+  if (documentData.visaType) lines.push(`체류자격: ${documentData.visaType}`);
+  if (documentData.area) lines.push(`지역: ${documentData.area}`);
+  if (documentData.address) lines.push(`주소: ${documentData.address}`);
+  if (documentData.issuedDate) lines.push(`발급일: ${documentData.issuedDate}`);
+  return lines.join('\n');
+}
+
+function renameAndSaveImages({ bmpPath, irPath }, baseFileName) {
+  const savedImages = [];
+
+  if (bmpPath && fs.existsSync(bmpPath)) {
+    const destPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}.bmp`);
+    fs.renameSync(bmpPath, destPath);
+    savedImages.push(destPath);
+  }
+  if (irPath && fs.existsSync(irPath)) {
+    const destPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}_IR.bmp`);
+    fs.renameSync(irPath, destPath);
+    savedImages.push(destPath);
+  }
+
+  return savedImages;
+}
+
+function saveResultFiles({ baseFileName, mrzText, documentData }) {
+  const txtPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}.txt`);
+  writeUtf8BomFileSync(txtPath, buildTextContent({ mrzText, documentData }));
+
+  if (documentData) {
+    const jsonPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}.json`);
+    writeUtf8BomFileSync(jsonPath, JSON.stringify(documentData, null, 2));
+  }
+}
+
 async function performScan() {
   if (isScanning) return;
   isScanning = true;
-  
+
   try {
-    // .NET과 동일한 형식: yyyyMMdd_HHmmss
-    const now = new Date();
-    const timestamp = now.getFullYear().toString() +
-      String(now.getMonth() + 1).padStart(2, '0') +
-      String(now.getDate()).padStart(2, '0') + '_' +
-      String(now.getHours()).padStart(2, '0') +
-      String(now.getMinutes()).padStart(2, '0') +
-      String(now.getSeconds()).padStart(2, '0');
-    // 스캔 임시 파일명이 초 단위면(500ms 루프) 이전 스캔과 충돌/재사용될 수 있어 ms를 포함해 유니크하게 만든다.
-    const ms0 = String(now.getMilliseconds()).padStart(3, '0');
-    const scanStamp = `${timestamp}_${ms0}`;
+    const scanStamp = createScanStamp(new Date());
     const tempBase = path.join(SAVE_FOLDER, scanStamp);
-    
-    // 스캔 시도 (여권 + 카드 자동 감지)
-    const scanResult = await scanner.scanAuto(tempBase);
-    
-    if (scanResult.success) {
-      console.log('[App] Scan type:', scanResult.type);
-      if (scanResult.type === 'card' && typeof scanResult.cardType === 'number') {
-        console.log('[App] Card scan mode (nType): 0x' + scanResult.cardType.toString(16));
-      }
-      // 스캔 결과 파일이 실제로 생성될 때까지 먼저 대기 (OCR/MRZ는 저장 완료 후에 안정적)
-      let expectedBmp = scanStamp + '.bmp';
-      let expectedIR = scanStamp + '_IR.bmp';
-      let expectedBmpPath = path.join(SAVE_FOLDER, expectedBmp);
-      let expectedIRPath = path.join(SAVE_FOLDER, expectedIR);
 
-      console.log('[App] Looking for:', expectedBmp);
-      const bmpReady = await waitForFileExists(expectedBmpPath, 8000, 250);
-      if (!bmpReady) {
-        console.log('[App] WARNING: BMP not ready in time:', expectedBmpPath);
-      }
-      // IR은 옵션
-      await waitForFileExists(expectedIRPath, 1500, 250);
+    console.log('[App] Step: scan');
+    const scanResult = await scanStep(tempBase);
+    if (!scanResult?.success) return; // 문서 없음
+    // 스캔이 정상 진행되면 timeout 누적 카운터는 리셋
+    consecutiveScanAutoTimeouts = 0;
 
-      // 파일 생성 후 OCR/MRZ 상태가 반영될 시간을 조금 더 줌
-      await sleep(600);
-
-      // 문서 종류 확인
-      const docType = await scanner.getDocumentType();
-      console.log('[App] Document type:', docType?.type, docType?.name || 'UNKNOWN');
-
-      let documentId = `UNKNOWN_${Date.now()}`;
-      let documentData = null;
-      let mrzText = '';
-
-      // 1) MRZ는 여권 스캔에서만 시도
-      // - 카드 스캔에서 MRZ를 매번 시도하면 Leptonica(TIFF) 에러가 반복되고,
-      //   일부 환경에서 이후 OCR 버퍼가 계속 0으로 남는(계속 실패처럼 보이는) 현상이 생길 수 있다.
-      let isPassportConfirmed = false;
-      if (scanResult.type === 'passport') {
-        for (let i = 0; i < 10; i++) {
-          const candidate = (await scanner.readMRZ()) || '';
-          if (candidate) console.log('[App] Raw MRZ:', candidate);
-          if (isValidPassportMRZ(candidate)) {
-            mrzText = candidate;
-            console.log('[App] Valid passport MRZ detected');
-            const passportNo = extractPassportNo(mrzText);
-            if (passportNo) documentId = passportNo;
-            documentData = parseMrzFull(mrzText);
-            if (documentData) documentData.documentType = 'PASSPORT';
-            isPassportConfirmed = true;
-            break;
-          }
-          await sleep(300);
-        }
-      }
-      
-      // 2) 카드 스캔 모드인 경우에만 OCR을 "재시도"하며 읽기
-      //    (여권 모드에서 OCR 결과는 이전 스캔 캐시일 가능성이 높음)
-      if ((!documentData || !documentData.documentType) && scanResult.type === 'card' && !isPassportConfirmed) {
-        for (let i = 0; i < 10; i++) {
-          const license = await scanner.readDriverLicense();
-          const idCard = await scanner.readIDCard();
-          const alien = await scanner.readAlienCard();
-          console.log('[App] Driver License OCR:', license);
-          console.log('[App] ID Card OCR:', idCard);
-          console.log('[App] Alien Card OCR:', alien);
-
-          // 주민등록증은 주민번호 패턴이 나오면 최우선
-          if (looksLikeKoreanRRN(idCard?.idNo)) {
-            documentId = String(idCard.idNo).replace(/-/g, '').substring(0, 6);
-            documentData = { ...idCard, documentType: 'ID_CARD' };
-            break;
-          }
-
-          // 운전면허는 면허번호 형식이 맞을 때만 채택 (주민등록증에서 직전 면허값 재사용 방지)
-          if (looksLikeDriverLicenseNo(license?.licenseNo)) {
-            documentId = license.licenseNo.replace(/-/g, '');
-            documentData = { ...license, documentType: 'DRIVER_LICENSE' };
-            break;
-          }
-
-          // 외국인등록증은 등록번호 형식이 맞을 때만 채택
-          if (looksLikeAlienRegNo(alien?.alienNo)) {
-            documentId = alien.alienNo.replace(/-/g, '').substring(0, 6);
-            documentData = { ...alien, documentType: 'ALIEN_CARD' };
-            break;
-          }
-
-          await sleep(250);
-        }
-
-        // NOTE: "OCR empty → nType 바꿔 재스캔"은 현장 로그 기준 효과가 없고(성공 사례 없음),
-        // 오히려 시간/불안정만 증가하여 제거함.
-      }
-
-      // 인식 여부 최종 판단: MRZ(여권) 또는 OCR(카드) 중 하나라도 있어야 "성공"
-      const recognized = (mrzText && mrzText.length > 10) || (documentData && documentData.documentType);
-      if (!recognized) {
-        lastFailedAt = Date.now();
-        // 자동 스캔 루프가 빈 문서/오인식을 계속 찍는 걸 막기 위해
-        // 파일을 저장/알림하지 않고 조용히 실패 처리
-        try { if (fs.existsSync(expectedBmpPath)) fs.unlinkSync(expectedBmpPath); } catch (_) {}
-        try { if (fs.existsSync(expectedIRPath)) fs.unlinkSync(expectedIRPath); } catch (_) {}
-        console.log('[App] Recognition failed - skipping save/notify (backoff applied)');
-        isScanning = false;
-        return;
-      }
-      
-      const parsedMrz = documentData;
-      
-      // documentId 검증 - null 바이트, 특수문자 제거
-      documentId = documentId.replace(/[\x00-\x1F\x7F<>:"/\\|?*]/g, '').trim();
-      if (!documentId || documentId.length < 2) {
-        documentId = `UNKNOWN_${Date.now()}`;
-      }
-      
-      // 파일명 충돌 방지: 스캔 시작 시각(초 포함) + ms 포함
-      const now2 = new Date();
-      const ms = String(now2.getMilliseconds()).padStart(3, '0');
-      const fileTimestamp = formatFileTimestamp(now2);
-      const baseFileName = `${documentId}_${fileTimestamp}_${ms}`;
-      
-      const newFiles = [];
-      if (fs.existsSync(expectedBmpPath)) {
-        newFiles.push(expectedBmp);
-      }
-      if (fs.existsSync(expectedIRPath)) {
-        newFiles.push(expectedIR);
-      }
-      
-      console.log('[App] Found BMP files:', newFiles);
-      
-      let savedImages = [];
-      
-      if (newFiles.length > 0) {
-        // 새 파일들을 여권번호 기반으로 이름 변경
-        newFiles.forEach((file, idx) => {
-          const srcPath = path.join(SAVE_FOLDER, file);
-          const suffix = file.includes('_IR') ? '_IR' : (idx > 0 ? `_${idx}` : '');
-          const destName = `${baseFileName}${suffix}.bmp`;
-          const destPath = uniqueFilePath(SAVE_FOLDER, destName);
-          
-          fs.renameSync(srcPath, destPath);
-          savedImages.push(destPath);
-          console.log('[App] Renamed:', file, '->', path.basename(destPath));
-        });
-      } else {
-        console.log('[App] WARNING: No new image files found!');
-      }
-      
-      // 텍스트 파일 저장 (문서 종류별로 다르게)
-      const txtPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}.txt`);
-      let textContent = '';
-      
-      // 1. 여권 MRZ가 있으면 MRZ 저장
-      if (mrzText && mrzText.length > 10) {
-        textContent = mrzText;
-      }
-      // 2. OCR 결과가 있으면 OCR 결과 저장 (신분증/면허증/외국인등록증)
-      else if (documentData && documentData.documentType) {
-        const lines = [];
-        lines.push(`[${documentData.documentType}]`);
-        if (documentData.name) lines.push(`이름: ${documentData.name}`);
-        if (documentData.idNo) lines.push(`주민번호: ${documentData.idNo}`);
-        if (documentData.licenseNo) lines.push(`면허번호: ${documentData.licenseNo}`);
-        if (documentData.licenseType) lines.push(`면허종류: ${documentData.licenseType}`);
-        if (documentData.validPeriod) lines.push(`적성기간: ${documentData.validPeriod}`);
-        if (documentData.alienNo) lines.push(`외국인번호: ${documentData.alienNo}`);
-        if (documentData.visaType) lines.push(`체류자격: ${documentData.visaType}`);
-        if (documentData.area) lines.push(`지역: ${documentData.area}`);
-        if (documentData.address) lines.push(`주소: ${documentData.address}`);
-        if (documentData.issuedDate) lines.push(`발급일: ${documentData.issuedDate}`);
-        textContent = lines.join('\n');
-      }
-      // 3. 아무것도 없으면 기본 메시지
-      else {
-        textContent = '[인식 실패]\n문서를 인식하지 못했습니다.';
-      }
-      
-      console.log('[App] Saving text file:', textContent.substring(0, 100));
-      writeUtf8BomFileSync(txtPath, textContent);
-      
-      // JSON 파일 저장 (파싱된 정보)
-      if (documentData) {
-        const jsonPath = uniqueFilePath(SAVE_FOLDER, `${baseFileName}.json`);
-        writeUtf8BomFileSync(jsonPath, JSON.stringify(documentData, null, 2));
-      }
-      
-      console.log('[App] Scan complete:', documentId, '- Type:', docType?.name, '- Images:', savedImages.length);
-      
-      // Renderer에 결과 전송
-      sendToRenderer('scan-result', {
-        ok: true,
-        passportNo: documentId,
-        documentId,
-        documentType: docType?.name || 'UNKNOWN',
-        mrz: mrzText,
-        parsed: parsedMrz,
-        imagePath: savedImages[0] || null,
-        images: savedImages,
-        timestamp: new Date().toISOString()
-      });
-      
-      // 스캔 후 잠시 대기 (같은 문서 중복 스캔 방지)
-      await sleep(1500);
-      isScanning = false;
-    } else {
-      // 문서 없음 - 바로 다음 시도 가능
-      isScanning = false;
+    console.log('[App] Step: wait images');
+    const images = await waitImagesStep(scanStamp);
+    if (!images.bmpPath) {
+      console.warn('[App] BMP not ready in time - skipping this scan');
+      lastFailedAt = Date.now();
+      return;
     }
+
+    console.log('[App] Step: detect document type');
+    const docType = await docTypeStepWithRetry(3, 300);
+    console.log('[App] Document type:', docType?.type, docType?.name || 'UNKNOWN');
+
+    console.log('[App] Step: OCR/MRZ');
+    let mrzText = '';
+    let documentData = null;
+
+    // 카드 스캔인데 문서 타입이 끝까지 UNKNOWN이면, OCR getter들을 마구 호출하지 않는다.
+    // (A스캔처럼 실패 케이스에서 DLL 내부 OCR 상태가 꼬여 다음 스캔(특히 운전면허)에 영향 주는 현상 방지)
+    if (scanResult.type === 'card' && (!docType || docType.name === 'UNKNOWN')) {
+      lastFailedAt = Date.now();
+      try { if (images.bmpPath && fs.existsSync(images.bmpPath)) fs.unlinkSync(images.bmpPath); } catch (_) {}
+      try { if (images.irPath && fs.existsSync(images.irPath)) fs.unlinkSync(images.irPath); } catch (_) {}
+      try { await withTimeout(scanner.resetState(), 800, 'scanner.resetState'); } catch (_) {}
+      console.log('[App] Document type UNKNOWN for card scan - skipping OCR to avoid state contamination');
+      return;
+    }
+
+    if (docType?.name === 'PASSPORT' || scanResult.type === 'passport') {
+      mrzText = await mrzStep();
+      if (mrzText) {
+        const parsed = parseMrzFull(mrzText);
+        if (parsed) {
+          parsed.documentType = 'PASSPORT';
+          documentData = parsed;
+        } else {
+          // MRZ가 유효해 보여도 파싱 실패면 저장은 MRZ 텍스트만
+          documentData = { documentType: 'PASSPORT' };
+        }
+      }
+    } else {
+      documentData = await ocrStep(docType);
+    }
+
+    const recognized = (mrzText && mrzText.length > 10) || isLikelyValidOcr(documentData);
+    if (!recognized) {
+      lastFailedAt = Date.now();
+      // 자동 스캔 루프에서 빈 문서/오인식 파일이 쌓이지 않도록 정리
+      try { if (images.bmpPath && fs.existsSync(images.bmpPath)) fs.unlinkSync(images.bmpPath); } catch (_) {}
+      try { if (images.irPath && fs.existsSync(images.irPath)) fs.unlinkSync(images.irPath); } catch (_) {}
+      // OCR/MRZ가 "이전 스캔 결과"를 다시 내놓는 케이스가 있어, 실패 시 내부 상태를 정리해 다음 스캔에 꼬리 안 남게 함
+      try { await withTimeout(scanner.resetState(), 800, 'scanner.resetState'); } catch (_) {}
+      console.log('[App] Recognition failed - skipping save/notify (backoff applied)');
+      return;
+    }
+
+    // JSON 저장/렌더러 전송 전에 날짜 포맷 정규화 (YYYYMMDD)
+    documentData = normalizeDocumentDataDates(documentData);
+
+    console.log('[App] Step: save files');
+    let documentId = deriveDocumentId(documentData, mrzText);
+    documentId = sanitizeFileComponent(documentId);
+    if (!documentId || documentId.length < 2) documentId = `UNKNOWN_${Date.now()}`;
+
+    const now = new Date();
+    const baseFileName = `${documentId}_${formatFileTimestamp(now)}_${String(now.getMilliseconds()).padStart(3, '0')}`;
+
+    const savedImages = renameAndSaveImages(images, baseFileName);
+    saveResultFiles({ baseFileName, mrzText, documentData });
+
+    console.log('[App] Step: notify renderer');
+    sendToRenderer('scan-result', {
+      ok: true,
+      passportNo: documentId,
+      documentId,
+      documentType: docType?.name || 'UNKNOWN',
+      mrz: mrzText,
+      parsed: documentData,
+      imagePath: savedImages[0] || null,
+      images: savedImages,
+      timestamp: new Date().toISOString()
+    });
+
+    // 같은 문서 중복 스캔 방지
+    await sleep(1200);
   } catch (err) {
     console.error('[App] Scan error:', err.message, err.stack);
+    // DLL/워커 호출이 멈춰버리면 다음 스캔이 영구적으로 안 되는 경우가 있어,
+    // 타임아웃 계열 에러는 자동으로 워커를 재시작해 복구를 시도한다.
+    if (String(err?.message || '').includes('timed out')) {
+      consecutiveScanAutoTimeouts++;
+      if (consecutiveScanAutoTimeouts >= 3) {
+        // 계속 timeout이면 자동 스캔 루프를 잠시 멈추고(장치 상태 보호),
+        // 사용자가 문서를 치우고 다시 올린 뒤 수동 스캔/재연결을 누를 수 있게 한다.
+        console.warn('[App] Too many scan timeouts; stopping scan loop temporarily');
+        stopScanLoop();
+        sendToRenderer('scanner-status', { connected: !!scannerOpened, error: '스캔 타임아웃 반복 - 문서를 치우고 재시도/재연결 해주세요' });
+        lastFailedAt = Date.now();
+      } else {
+        await forceReconnectScanner(err.message).catch(() => {});
+      }
+    }
+  } finally {
     isScanning = false;
+    if (pendingManualScan) {
+      pendingManualScan = false;
+      lastFailedAt = 0;
+      // 현재 스캔이 끝난 직후, 큐잉된 수동 스캔을 1회 수행
+      setTimeout(() => {
+        performScan().catch(() => {});
+      }, 50);
+    }
   }
 }
 
@@ -527,38 +735,21 @@ ipcMain.handle('manual-scan', async () => {
     return { ok: false, error: 'Scanner not connected' };
   }
   
+  // 수동 스캔은 직전 실패 backoff를 무시하고 즉시 시도 (사용자가 "지금 스캔"을 눌렀는데 대기하면 UX가 나쁨)
+  lastFailedAt = 0;
+  console.log('[App] Manual scan requested');
+  // 자동 스캔 루프가 이미 스캔 중이면 performScan()이 바로 return 하므로, 반드시 1회 큐잉한다.
+  if (isScanning) {
+    pendingManualScan = true;
+    return { ok: true, queued: true };
+  }
   performScan().catch(() => {});
-  return { ok: true };
+  return { ok: true, queued: false };
 });
 
 ipcMain.handle('reconnect-scanner', async () => {
-  // 1) 기존 연결 닫기(완료될 때까지 대기)
-  await closeDevice().catch(() => {});
-  // 장치/드라이버 정리 시간 약간 부여
-  await sleep(250);
-
-  // 2) 빠른 재연결 시도 (짧은 타임아웃)
-  let success = await tryOpenDevice().catch(() => false);
-  if (success) return { ok: true };
-
-  // 3) 여전히 실패/지연이면 워커 자체를 재시작(걸린 호출을 끊기 위해)
-  try {
-    if (scanner && typeof scanner.destroy === 'function') {
-      await withTimeout(scanner.destroy(), 1500, 'scanner.destroy');
-    }
-  } catch (_) {}
-
-  // 새 워커/클라이언트 생성 후 재시도
-  scanner = new ScannerClient();
-  const inited = await withTimeout(scanner.init(), 3000, 'scanner.init').catch(() => false);
-  if (!inited) {
-    scannerOpened = false;
-    sendToRenderer('scanner-status', { connected: false, error: 'DLL 로드 실패' });
-    return { ok: false, error: 'init failed' };
-  }
-
-  success = await tryOpenDevice().catch(() => false);
-  return { ok: success };
+  const ok = await forceReconnectScanner('manual reconnect').catch(() => false);
+  return { ok: !!ok };
 });
 
 ipcMain.handle('start-scan-loop', () => {
